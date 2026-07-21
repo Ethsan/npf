@@ -184,7 +184,7 @@ struct bpf_program *npfctl_bpf_complete(npf_bpf_t *);
 const void *	npfctl_bpf_bmarks(npf_bpf_t *, size_t *);
 void		npfctl_bpf_destroy(npf_bpf_t *);
 
-void		npfctl_bpf_group_enter(npf_bpf_t *, bool);
+void		npfctl_bpf_group_enter(npf_bpf_t *, bool, bool);
 void		npfctl_bpf_group_exit(npf_bpf_t *);
 
 void		npfctl_bpf_ipver(npf_bpf_t *, sa_family_t);

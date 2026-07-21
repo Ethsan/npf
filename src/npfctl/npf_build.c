@@ -261,6 +261,21 @@ npfctl_get_singletable(const npfvar_t *vp)
 	return *tid;
 }
 
+/*
+ * npfctl_fam_skip_p: true if npfctl_build_fam() below would emit no
+ * block for this address (mirrors its two "return false" cases, minus
+ * the error reporting).  Used by npfctl_build_vars() to predict the
+ * real block count in advance.
+ */
+static bool
+npfctl_fam_skip_p(sa_family_t family, const fam_addr_mask_t *fam)
+{
+	if (family != AF_UNSPEC && family != fam->fam_family) {
+		return fam->fam_ifindex != 0;
+	}
+	return fam->fam_mask == 0 && npfctl_addr_iszero(&fam->fam_addr);
+}
+
 static bool
 npfctl_build_fam(npf_bpf_t *ctx, sa_family_t family,
     fam_addr_mask_t *fam, unsigned opts)
@@ -301,8 +316,28 @@ npfctl_build_fam(npf_bpf_t *ctx, sa_family_t family,
 static void
 npfctl_build_vars(npf_bpf_t *ctx, sa_family_t family, npfvar_t *vars, int opts)
 {
-	npfctl_bpf_group_enter(ctx, (opts & MATCH_INVERT) != 0);
-	for (unsigned i = 0; i < npfvar_get_count(vars); i++) {
+	const unsigned count = npfvar_get_count(vars);
+	const bool invert = (opts & MATCH_INVERT) != 0;
+
+	/*
+	 * Count the blocks this will really emit: every element counts,
+	 * except a NPFVAR_FAM entry npfctl_fam_skip_p() says will be
+	 * skipped.  npfctl_bpf_group_enter() needs this - see its comment.
+	 */
+	unsigned real_count = 0;
+	for (unsigned i = 0; i < count; i++) {
+		const unsigned type = npfvar_get_type(vars, i);
+		if (type == NPFVAR_FAM) {
+			fam_addr_mask_t *fam = npfvar_get_data(vars, type, i);
+			if (npfctl_fam_skip_p(family, fam)) {
+				continue;
+			}
+		}
+		real_count++;
+	}
+
+	npfctl_bpf_group_enter(ctx, invert, invert || real_count > 1);
+	for (unsigned i = 0; i < count; i++) {
 		const unsigned type = npfvar_get_type(vars, i);
 		void *data = npfvar_get_data(vars, type, i);
 
@@ -392,7 +427,8 @@ npfctl_build_proto(npf_bpf_t *ctx, const npfvar_t *vars)
 		return;
 	}
 
-	npfctl_bpf_group_enter(ctx, false);
+	/* count >= 2 here, and each iteration adds exactly one block. */
+	npfctl_bpf_group_enter(ctx, false, true);
 	for (unsigned i = 0; i < count; i++) {
 		const opt_proto_t *op = npfvar_get_data(vars, NPFVAR_PROTO, i);
 		npfctl_build_proto_block(ctx, op, true);
@@ -493,7 +529,8 @@ npfctl_build_code(nl_rule_t *rl, sa_family_t family, const npfvar_t *popts,
 	 * then we implicitly filter for the TCP / UDP protocols.
 	 */
 	if (any_ports && !any_l4proto) {
-		npfctl_bpf_group_enter(bc, false);
+		/* Exactly two unconditional blocks are added below. */
+		npfctl_bpf_group_enter(bc, false, true);
 		npfctl_bpf_proto(bc, IPPROTO_TCP);
 		npfctl_bpf_proto(bc, IPPROTO_UDP);
 		npfctl_bpf_group_exit(bc);

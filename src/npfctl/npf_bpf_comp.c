@@ -137,6 +137,13 @@ struct npf_bpf {
 	unsigned		goff;
 	unsigned		gblock;
 
+	/*
+	 * Whether the current group is known, in advance, to combine more
+	 * than one block with OR (or is inverted).  Set by the caller of
+	 * npfctl_bpf_group_enter(); see npfctl_bpf_cidr().
+	 */
+	bool			group_swap;
+
 	/* Track inversion (excl. mark). */
 	uint32_t		invflags;
 
@@ -310,9 +317,15 @@ npfctl_bpf_destroy(npf_bpf_t *ctx)
 /*
  * npfctl_bpf_group_enter: begin a logical group.  It merely uses logical
  * disjunction (OR) for comparisons within the group.
+ *
+ * `multi` tells whether the caller is about to add more than one block
+ * to this group.  If unsure, pass true: npfctl_bpf_cidr() needs it to
+ * know whether the group will actually be resolved with a jt/jf swap or
+ * deferred (see npfctl_bpf_group_exit()), and getting it wrong would
+ * miscompile a multi-word CIDR block's interior words.
  */
 void
-npfctl_bpf_group_enter(npf_bpf_t *ctx, bool invert)
+npfctl_bpf_group_enter(npf_bpf_t *ctx, bool invert, bool multi)
 {
 	struct bpf_program *bp = &ctx->prog;
 
@@ -322,6 +335,7 @@ npfctl_bpf_group_enter(npf_bpf_t *ctx, bool invert)
 	ctx->goff = bp->bf_len;
 	ctx->gblock = ctx->nblocks;
 	ctx->invert = invert;
+	ctx->group_swap = invert || multi;
 	ctx->ingroup++;
 }
 
@@ -333,6 +347,17 @@ npfctl_bpf_group_exit(npf_bpf_t *ctx)
 
 	assert(ctx->ingroup);
 	ctx->ingroup--;
+
+	/*
+	 * Verify the multi-block hint given to npfctl_bpf_group_enter()
+	 * against the now-known real block count, to catch a wrong hint
+	 * immediately instead of silently miscompiling.  Skipped when no
+	 * blocks were added: fetch_l3() closes and reopens the group
+	 * around the IP version check before any block exists, which
+	 * isn't the group's real, final close.
+	 */
+	assert(ctx->nblocks == ctx->gblock ||
+	    ctx->group_swap == (ctx->invert || (ctx->nblocks - ctx->gblock) > 1));
 
 	/* If there are no blocks or only one - nothing to do. */
 	if (!ctx->invert && (ctx->nblocks - ctx->gblock) <= 1) {
@@ -399,6 +424,7 @@ fetch_l3(npf_bpf_t *ctx, sa_family_t af, unsigned flags)
 		const uint8_t jf = ver ? JUMP_MAGIC : 0;
 		const bool ingroup = ctx->ingroup != 0;
 		const bool invert = ctx->invert;
+		const bool group_swap = ctx->group_swap;
 
 		/*
 		 * L3 block cannot be inserted in the middle of a group.
@@ -426,7 +452,7 @@ fetch_l3(npf_bpf_t *ctx, sa_family_t af, unsigned flags)
 			add_bmarks(ctx, mwords, sizeof(mwords));
 		}
 		if (ingroup) {
-			npfctl_bpf_group_enter(ctx, invert);
+			npfctl_bpf_group_enter(ctx, invert, group_swap);
 		}
 
 	} else if (af && af != ctx->af) {
@@ -531,10 +557,18 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 
 	length = (mask == NPF_NO_NETMASK) ? maxmask : mask;
 
+	/*
+	 * Determine the words within the prefix length and whether each
+	 * of them requires masking.  Only the last active word can end up
+	 * partially masked; every word before it necessarily covers the
+	 * full 32 bits (the mask loop below breaks as soon as the prefix
+	 * length is exhausted).
+	 */
+	uint32_t words[4], wordmasks[4];
+	unsigned nactive = 0;
+
 	/* CAUTION: BPF operates in host byte-order. */
 	for (unsigned i = 0; i < nwords; i++) {
-		const unsigned woff = i * sizeof(uint32_t);
-		uint32_t word = ntohl(awords[i]);
 		uint32_t wordmask;
 
 		if (length >= 32) {
@@ -548,24 +582,72 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 			/* The mask became zero - skip the rest. */
 			break;
 		}
+		words[nactive] = ntohl(awords[i]);
+		wordmasks[nactive] = wordmask;
+		nactive++;
+	}
 
-		/* A <- IP address (or one word of it) */
+	/*
+	 * All the words above must match (AND) for this block to match.
+	 * A group combines blocks with OR by swapping the jt/jf of any
+	 * JUMP_MAGIC use in its range, per-instruction - so if more than
+	 * one word here carried JUMP_MAGIC, each would be swapped on its
+	 * own, turning "all words match" into "any word matches".  Only
+	 * the last word may carry it, since only its outcome (once every
+	 * earlier word is known to match) reflects the block as a whole.
+	 *
+	 * Earlier words need a mismatch target that isn't JUMP_MAGIC but
+	 * still reaches whatever it resolves to.  Standalone (not really
+	 * inside a multi-block group), that target is unknown until later
+	 * and JUMP_MAGIC is required - safe to use on every word here,
+	 * since with no swap applied each resolves independently anyway.
+	 * Inside a real group, the target is simply the end of this block
+	 * (start of the next alternative), a fixed offset known right
+	 * here - no JUMP_MAGIC, no extra instructions.
+	 */
+	const bool ingroup = ctx->ingroup != 0 && ctx->group_swap;
+
+	for (unsigned i = 0; i < nactive; i++) {
+		const unsigned woff = i * sizeof(uint32_t);
+		const bool last = (i == nactive - 1);
+
+		/* A <- IP address word */
 		struct bpf_insn insns_ip[] = {
 			BPF_STMT(BPF_LD+BPF_W+BPF_ABS, off + woff),
 		};
 		add_insns(ctx, insns_ip, __arraycount(insns_ip));
 
 		/* A <- (A & MASK) */
-		if (wordmask) {
+		if (wordmasks[i]) {
 			struct bpf_insn insns_mask[] = {
-				BPF_STMT(BPF_ALU+BPF_AND+BPF_K, wordmask),
+				BPF_STMT(BPF_ALU+BPF_AND+BPF_K, wordmasks[i]),
 			};
 			add_insns(ctx, insns_mask, __arraycount(insns_mask));
 		}
 
-		/* A == expected-IP-word ? */
+		if (last) {
+			/* A == expected-IP-word ? -- the sole JUMP_MAGIC */
+			struct bpf_insn insns_cmp[] = {
+				BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, words[i], 0, JUMP_MAGIC),
+			};
+			add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
+			continue;
+		}
+
+		unsigned jf;
+		if (ingroup) {
+			/* Skip the remaining words (2-3 insns each). */
+			unsigned skip = 0;
+			for (unsigned j = i + 1; j < nactive; j++) {
+				skip += wordmasks[j] ? 3 : 2;
+			}
+			jf = skip;
+		} else {
+			jf = JUMP_MAGIC;
+		}
+
 		struct bpf_insn insns_cmp[] = {
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, word, 0, JUMP_MAGIC),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, words[i], 0, jf),
 		};
 		add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
 	}
