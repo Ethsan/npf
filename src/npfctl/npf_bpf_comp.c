@@ -51,20 +51,22 @@
  *
  *	- If the value is false, then jump to the JUMP_FAIL value.
  *
- *	JUMP_OK and JUMP_FAIL are "magic" values used to indicate that
- *	the jump will have to be patched at a later stage, once the real
- *	target offset is known.
+ *	JUMP_OK and JUMP_FAIL are "magic" values which mark a jump as
+ *	unresolved.  Every unresolved JUMP_OK is tracked on the "OK list"
+ *	and every unresolved JUMP_FAIL on the "fail list"; as soon as it
+ *	is known what a criterion's success or failure should actually
+ *	lead to, the relevant list is "sealed": every jump on it is
+ *	patched to the given target and the list is emptied again.
  *
- *	Once all byte-code fragments are combined into one, then there
- *	are two additional steps:
- *
- *	- Two instructions are appended at the end of the program: "return
- *	success" followed by "return failure".
- *
- *	- All jumps with the JUMP_OK value are patched to fall through to
- *	the next instruction (the "return success" path) and all jumps
- *	with the JUMP_FAIL value are patched to point to the "return
- *	failure" instruction.
+ *	Since each criterion in the conjunction is simply followed by the
+ *	next, the OK list is sealed to the start of the next criterion as
+ *	soon as it begins.  The fail list is left pending, since a
+ *	failure of any criterion should skip the rest of the conjunction;
+ *	it accumulates across criteria and is only sealed once the final
+ *	target is known, i.e. by npfctl_bpf_complete() (to the "return
+ *	failure" instruction) or earlier by an enclosing group (see
+ *	below).  npfctl_bpf_complete() likewise seals the OK list to a
+ *	"return success" instruction that it appends right before it.
  *
  *	Therefore, if all filter criteria will match, then the first
  *	instruction will be reached, indicating a successful match of the
@@ -78,12 +80,21 @@
  *
  *		A and B and (C or D)
  *
- *	In such case, the logic inside the group is inverted: JUMP_OK is
- *	patched to jump out of the group (skipping the remaining
- *	alternatives), while JUMP_FAIL is patched to fall through and try
- *	the "next" alternative.  At the end of the group, an additional
- *	failure path is appended and the JUMP_OK uses within the group are
- *	patched to jump past the said path.
+ *	Within a group, the roles are reversed: the fail list is sealed
+ *	to the start of the next alternative as soon as it begins (a
+ *	failed alternative simply tries the next one), while the OK list
+ *	accumulates across every alternative (a match on any one of them
+ *	means the whole group matches) and is left pending for whatever
+ *	follows the group.  Since the OK list must not be conflated with
+ *	whatever fail list was already pending for the rule from before
+ *	the group started, npfctl_bpf_group_enter() sets it aside and
+ *	npfctl_bpf_group_exit() restores it once the group's own fail
+ *	list -- what's left after every alternative but the last has been
+ *	tried -- has been sealed to a "return failure" instruction
+ *	appended right there.  A negated group ("not (C or D)") simply
+ *	swaps the two lists before doing so: any alternative matching
+ *	should then fail the group, and only exhausting every alternative
+ *	without a match should let it succeed.
  */
 
 #include <sys/cdefs.h>
@@ -119,6 +130,25 @@ __RCSID("$NetBSD$");
 #define	CHECKED_L4_PROTO	0x02
 #define	X_EQ_L4OFF		0x04
 
+/*
+ * A pending, unresolved jump: the index of the BPF instruction and
+ * which of its fields (jt, jf or, for BPF_JA, k) holds the marker.
+ */
+typedef struct {
+	unsigned		insn;
+	uint8_t			which;
+} bpf_patch_t;
+#define	PATCH_JT		0
+#define	PATCH_JF		1
+#define	PATCH_K			2
+
+/* A growable list of pending jumps (the "OK list" / "fail list"). */
+typedef struct {
+	bpf_patch_t *		items;
+	size_t			len;
+	size_t			alen;
+} patch_list_t;
+
 struct npf_bpf {
 	/*
 	 * BPF program code, the allocated length (in bytes), the number
@@ -132,18 +162,25 @@ struct npf_bpf {
 
 	/*
 	 * Indicators whether we are inside the group and whether this
-	 * group is implementing inverted logic.
-	 *
-	 * The current group offset (counted in BPF instructions)
-	 * and block number at the start of the group.
+	 * group is implementing inverted logic, and the block number at
+	 * the start of the group.
 	 */
 	unsigned		ingroup;
 	bool			invert;
-	unsigned		goff;
 	unsigned		gblock;
 
 	/* Track inversion (excl. mark). */
 	uint32_t		invflags;
+
+	/*
+	 * Pending JUMP_OK / JUMP_FAIL sites; see the "Grouping" comment
+	 * above.  saved_faillist is where npfctl_bpf_group_enter() sets
+	 * aside the rule's own (pre-group) fail list while a group's
+	 * alternatives build up one of their own.
+	 */
+	patch_list_t		oklist;
+	patch_list_t		faillist;
+	patch_list_t		saved_faillist;
 
 	/* BPF marks, allocated length and the real length. */
 	uint32_t *		marks;
@@ -158,20 +195,19 @@ struct npf_bpf {
 #define	NPF_BPF_FAILURE		0
 
 /*
- * Magic values to indicate the success and failure paths, which are
- * fixed up by fixup_jumps() once a criterion, group or the whole
- * program is complete and the real target offsets are known.
- * Note: these are the longest jump offsets in BPF, since the offset
- * is one byte.
+ * Magic values marking an unresolved jump; see the "OK list" / "fail
+ * list" description above.  Note: these double as the longest jump
+ * offset in BPF, since the offset is one byte -- see patch_to().
  *
- * CAUTION: fixup_jumps() resolves JUMP_OK/JUMP_FAIL to either a fixed
- * offset (independent of where the instruction sits) or a plain
- * fall-through to the very next instruction (which depends on it).
- * Which of the two applies flips depending on whether the code is
- * inside a group, so only the *last* instruction of a multi-instruction
- * criterion may use these markers directly -- earlier instructions must
- * reach that last instruction (or otherwise resolve the criterion)
- * using plain, non-BPF_JMP arithmetic instead (see npfctl_bpf_cidr()
+ * CAUTION: within a single multi-instruction criterion (e.g. matching
+ * several words of an IPv6 address), only the branch that determines
+ * the criterion's *overall* success or failure may use these markers.
+ * A branch that merely continues on to more instructions of the very
+ * same criterion (e.g. "this word matched, check the next one") must
+ * instead be a plain, literal jump to that next instruction: were it
+ * marked JUMP_OK, it would eventually be resolved exactly like the
+ * criterion's real, final success and could jump out past the
+ * remaining instructions on a partial match (see npfctl_bpf_cidr()
  * and the port range case in npfctl_bpf_ports() for examples).
  */
 #define	JUMP_OK			0xfe
@@ -192,52 +228,90 @@ npfctl_bpf_create(void)
 }
 
 static void
-fixup_jumps(npf_bpf_t *ctx, u_int start, u_int end, bool swap)
+list_add(patch_list_t *list, unsigned insn, uint8_t which)
+{
+	if (list->len == list->alen) {
+		list->alen = list->alen ? list->alen * 2 : 8;
+		list->items = erealloc(list->items,
+		    list->alen * sizeof(bpf_patch_t));
+	}
+	list->items[list->len].insn = insn;
+	list->items[list->len].which = which;
+	list->len++;
+}
+
+/* Concatenate 'src' onto the end of 'dst' and empty 'src' out. */
+static void
+merge_list(patch_list_t *dst, patch_list_t *src)
+{
+	for (size_t i = 0; i < src->len; i++) {
+		list_add(dst, src->items[i].insn, src->items[i].which);
+	}
+	free(src->items);
+	memset(src, 0, sizeof(*src));
+}
+
+/*
+ * patch_to: resolve every pending jump on 'list' to the given target
+ * (a BPF instruction index) and empty the list back out.
+ */
+static void
+patch_to(npf_bpf_t *ctx, patch_list_t *list, unsigned target)
 {
 	struct bpf_program *bp = &ctx->prog;
 
-	for (u_int i = start; i < end; i++) {
-		struct bpf_insn *insn = &bp->bf_insns[i];
-		const u_int away_off = end - i;
+	for (size_t i = 0; i < list->len; i++) {
+		const unsigned insn = list->items[i].insn;
+		const unsigned off = target - insn - 1;
 
-		if (away_off >= JUMP_OK) {
+		if (off >= JUMP_OK) {
 			errx(EXIT_FAILURE, "BPF generation error: "
 			    "the number of instructions is over the limit");
 		}
-		if (BPF_CLASS(insn->code) != BPF_JMP) {
-			continue;
+		struct bpf_insn *ip = &bp->bf_insns[insn];
+		switch (list->items[i].which) {
+		case PATCH_JT:
+			ip->jt = off;
+			break;
+		case PATCH_JF:
+			ip->jf = off;
+			break;
+		case PATCH_K:
+			ip->k = off;
+			break;
 		}
-		if (BPF_OP(insn->code) == BPF_JA) {
-			/*
-			 * BPF_JA is only ever used to indicate failure.
-			 * If we are inside a group, then jump "next" to
-			 * try the next alternative; groups have a failure
-			 * path appended at their end.
-			 */
-			if (insn->k == JUMP_FAIL) {
-				insn->k = swap ? 0 : away_off;
-			}
-			continue;
-		}
+	}
+	list->len = 0;
+}
 
-		/*
-		 * Resolve the JUMP_OK / JUMP_FAIL markers independently:
-		 * outside of a group, success falls through to the next
-		 * criterion and failure jumps away to the failure path;
-		 * inside a group (disjunction), it is the other way
-		 * around -- success jumps out of the group, while failure
-		 * falls through to try the next alternative.
-		 */
-		if (insn->jt == JUMP_OK) {
-			insn->jt = swap ? away_off : 0;
-		} else if (insn->jt == JUMP_FAIL) {
-			insn->jt = swap ? 0 : away_off;
-		}
-		if (insn->jf == JUMP_OK) {
-			insn->jf = swap ? away_off : 0;
-		} else if (insn->jf == JUMP_FAIL) {
-			insn->jf = swap ? 0 : away_off;
-		}
+/* Seal the OK list to the current end of the program (a match here). */
+static void
+seal_ok(npf_bpf_t *ctx)
+{
+	patch_to(ctx, &ctx->oklist, ctx->prog.bf_len);
+}
+
+/* Seal the fail list to the current end of the program (a miss here). */
+static void
+seal_fail(npf_bpf_t *ctx)
+{
+	patch_to(ctx, &ctx->faillist, ctx->prog.bf_len);
+}
+
+/*
+ * seal_prev: called at the start of every criterion.  Outside of a
+ * group (or for the first alternative of one), the new criterion is
+ * ANDed with whatever came before, so the OK list is sealed to here.
+ * For a later alternative within a group, it is ORed with the
+ * previous ones instead, so the fail list is sealed to here.
+ */
+static void
+seal_prev(npf_bpf_t *ctx)
+{
+	if (ctx->ingroup && ctx->nblocks > ctx->gblock) {
+		seal_fail(ctx);
+	} else {
+		seal_ok(ctx);
 	}
 }
 
@@ -246,6 +320,7 @@ add_insns(npf_bpf_t *ctx, struct bpf_insn *insns, size_t count)
 {
 	struct bpf_program *bp = &ctx->prog;
 	size_t offset, len, reqlen;
+	const unsigned base = bp->bf_len;
 
 	/* Note: bf_len is the count of instructions. */
 	offset = bp->bf_len * sizeof(struct bpf_insn);
@@ -261,6 +336,35 @@ add_insns(npf_bpf_t *ctx, struct bpf_insn *insns, size_t count)
 	/* Add the code block. */
 	memcpy((uint8_t *)bp->bf_insns + offset, insns, len);
 	bp->bf_len += count;
+
+	/* Track any JUMP_OK / JUMP_FAIL markers on the OK / fail list. */
+	for (unsigned i = 0; i < count; i++) {
+		const unsigned idx = base + i;
+		struct bpf_insn *insn = &bp->bf_insns[idx];
+
+		if (BPF_CLASS(insn->code) != BPF_JMP) {
+			continue;
+		}
+		if (BPF_OP(insn->code) == BPF_JA) {
+			/* BPF_JA is only ever used to indicate failure. */
+			if (insn->k == JUMP_OK) {
+				list_add(&ctx->oklist, idx, PATCH_K);
+			} else if (insn->k == JUMP_FAIL) {
+				list_add(&ctx->faillist, idx, PATCH_K);
+			}
+			continue;
+		}
+		if (insn->jt == JUMP_OK) {
+			list_add(&ctx->oklist, idx, PATCH_JT);
+		} else if (insn->jt == JUMP_FAIL) {
+			list_add(&ctx->faillist, idx, PATCH_JT);
+		}
+		if (insn->jf == JUMP_OK) {
+			list_add(&ctx->oklist, idx, PATCH_JF);
+		} else if (insn->jf == JUMP_FAIL) {
+			list_add(&ctx->faillist, idx, PATCH_JF);
+		}
+	}
 }
 
 static void
@@ -291,21 +395,27 @@ struct bpf_program *
 npfctl_bpf_complete(npf_bpf_t *ctx)
 {
 	struct bpf_program *bp = &ctx->prog;
-	const u_int retoff = bp->bf_len;
 
 	/* No instructions (optimised out). */
 	if (!bp->bf_len)
 		return NULL;
 
-	/* Add the return fragment (success and failure paths). */
-	struct bpf_insn insns_ret[] = {
+	/* A match: seal the OK list to a "return success" here. */
+	seal_ok(ctx);
+	struct bpf_insn insns_ok[] = {
 		BPF_STMT(BPF_RET+BPF_K, NPF_BPF_SUCCESS),
+	};
+	add_insns(ctx, insns_ok, __arraycount(insns_ok));
+
+	/* No match: seal the fail list to a "return failure" here. */
+	seal_fail(ctx);
+	struct bpf_insn insns_fail[] = {
 		BPF_STMT(BPF_RET+BPF_K, NPF_BPF_FAILURE),
 	};
-	add_insns(ctx, insns_ret, __arraycount(insns_ret));
+	add_insns(ctx, insns_fail, __arraycount(insns_fail));
 
-	/* Fixup all jumps to the main failure path. */
-	fixup_jumps(ctx, 0, retoff, false);
+	assert(ctx->oklist.len == 0);
+	assert(ctx->faillist.len == 0);
 
 	return &ctx->prog;
 }
@@ -322,6 +432,9 @@ npfctl_bpf_destroy(npf_bpf_t *ctx)
 {
 	free(ctx->prog.bf_insns);
 	free(ctx->marks);
+	free(ctx->oklist.items);
+	free(ctx->faillist.items);
+	free(ctx->saved_faillist.items);
 	free(ctx);
 }
 
@@ -332,59 +445,61 @@ npfctl_bpf_destroy(npf_bpf_t *ctx)
 void
 npfctl_bpf_group_enter(npf_bpf_t *ctx, bool invert)
 {
-	struct bpf_program *bp = &ctx->prog;
-
-	assert(ctx->goff == 0);
 	assert(ctx->gblock == 0);
 
-	ctx->goff = bp->bf_len;
 	ctx->gblock = ctx->nblocks;
 	ctx->invert = invert;
 	ctx->ingroup++;
+
+	/*
+	 * The group's alternatives build up a fail list of their own
+	 * (sealed between alternatives); set aside whatever was already
+	 * pending for the rule's own failure path until we exit again.
+	 */
+	ctx->saved_faillist = ctx->faillist;
+	memset(&ctx->faillist, 0, sizeof(ctx->faillist));
 }
 
 void
 npfctl_bpf_group_exit(npf_bpf_t *ctx)
 {
-	struct bpf_program *bp = &ctx->prog;
-	const size_t curoff = bp->bf_len;
-
 	assert(ctx->ingroup);
 	ctx->ingroup--;
 
 	/* If there are no blocks or only one - nothing to do. */
 	if (!ctx->invert && (ctx->nblocks - ctx->gblock) <= 1) {
-		ctx->goff = ctx->gblock = 0;
+		merge_list(&ctx->faillist, &ctx->saved_faillist);
+		ctx->gblock = 0;
 		return;
 	}
 
-	/*
-	 * If inverting, then prepend a jump over the statement below.
-	 * On match, it will skip-through and the fail path will be taken.
-	 */
 	if (ctx->invert) {
-		struct bpf_insn insns_ret[] = {
-			BPF_STMT(BPF_JMP+BPF_JA, 1),
-		};
-		add_insns(ctx, insns_ret, __arraycount(insns_ret));
+		/*
+		 * Negated group: any alternative matching should fail
+		 * the group, and only exhausting every alternative
+		 * without a match should let it succeed.  Swap the
+		 * accumulated lists to reflect that.
+		 */
+		patch_list_t tmp = ctx->oklist;
+		ctx->oklist = ctx->faillist;
+		ctx->faillist = tmp;
 	}
 
 	/*
-	 * Append a failure return as a fall-through i.e. if there is
-	 * no match within the group.
+	 * No alternative matched: seal the group's own fail list to a
+	 * "return failure" appended here.  The OK list (any alternative
+	 * matching) is left pending for whatever follows the group.
 	 */
+	seal_fail(ctx);
 	struct bpf_insn insns_ret[] = {
 		BPF_STMT(BPF_RET+BPF_K, NPF_BPF_FAILURE),
 	};
 	add_insns(ctx, insns_ret, __arraycount(insns_ret));
 
-	/*
-	 * Adjust jump offsets: on match - jump outside the group i.e.
-	 * to the current offset.  Otherwise, jump to the next instruction
-	 * which would lead to the fall-through code above if none matches.
-	 */
-	fixup_jumps(ctx, ctx->goff, curoff, true);
-	ctx->goff = ctx->gblock = 0;
+	/* Restore the rule's own fail list for whatever follows. */
+	ctx->faillist = ctx->saved_faillist;
+	memset(&ctx->saved_faillist, 0, sizeof(ctx->saved_faillist));
+	ctx->gblock = 0;
 }
 
 static void
@@ -439,6 +554,13 @@ fetch_l3(npf_bpf_t *ctx, sa_family_t af, unsigned flags)
 		ctx->flags |= FETCHED_L3;
 		ctx->af = af;
 
+		/*
+		 * A match here just continues into whatever this call's
+		 * caller (or, if it adds nothing more of its own, whatever
+		 * criterion follows next) emits right after we return.
+		 */
+		seal_ok(ctx);
+
 		if (af) {
 			uint32_t mwords[] = { BM_IPVER, 1, af };
 			add_bmarks(ctx, mwords, sizeof(mwords));
@@ -489,6 +611,7 @@ bm_invert_checkpoint(npf_bpf_t *ctx, const unsigned opts)
 void
 npfctl_bpf_ipver(npf_bpf_t *ctx, sa_family_t af)
 {
+	seal_prev(ctx);
 	fetch_l3(ctx, af, 0);
 }
 
@@ -498,6 +621,8 @@ npfctl_bpf_ipver(npf_bpf_t *ctx, sa_family_t af)
 void
 npfctl_bpf_proto(npf_bpf_t *ctx, unsigned proto)
 {
+	seal_prev(ctx);
+
 	struct bpf_insn insns_proto[] = {
 		/* A <- L4 protocol; A == expected-protocol? */
 		BPF_STMT(BPF_LD+BPF_W+BPF_MEM, BPF_MW_L4PROTO),
@@ -544,28 +669,15 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 		abort();
 	}
 
+	seal_prev(ctx);
+
 	/* Ensure address family. */
 	fetch_l3(ctx, af, 0);
 
 	length = (mask == NPF_NO_NETMASK) ? maxmask : mask;
 
-	/* The number of words that will actually be compared. */
-	unsigned ncmp = (length + 31) / 32;
-	if (ncmp > nwords) {
-		ncmp = nwords;
-	}
-
-	/*
-	 * CAUTION: BPF operates in host byte-order.
-	 *
-	 * Only the last compared word may use JUMP_OK/JUMP_FAIL directly:
-	 * a match on an earlier word does not yet mean the whole address
-	 * matches.  So, instead of a per-word conditional jump, XOR each
-	 * word against its expected value and OR the differences together
-	 * in X; the accumulated value is zero iff every word matched, and
-	 * only the final word needs a (single) conditional jump.
-	 */
-	for (unsigned i = 0; i < ncmp; i++) {
+	/* CAUTION: BPF operates in host byte-order. */
+	for (unsigned i = 0; i < nwords; i++) {
 		const unsigned woff = i * sizeof(uint32_t);
 		uint32_t word = ntohl(awords[i]);
 		uint32_t wordmask;
@@ -574,9 +686,12 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 			/* The mask is a full word - do not apply it. */
 			wordmask = 0;
 			length -= 32;
-		} else {
+		} else if (length) {
 			wordmask = 0xffffffff << (32 - length);
 			length = 0;
+		} else {
+			/* The mask became zero - skip the rest. */
+			break;
 		}
 
 		/* A <- IP address (or one word of it) */
@@ -593,37 +708,18 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 			add_insns(ctx, insns_mask, __arraycount(insns_mask));
 		}
 
-		/* A <- A ^ expected-IP-word (zero iff this word matches) */
-		struct bpf_insn insns_xor[] = {
-			BPF_STMT(BPF_ALU+BPF_XOR+BPF_K, word),
+		/*
+		 * A == expected-IP-word?  A match on any word but the
+		 * last one just continues on to the next word (a plain
+		 * literal jump, not JUMP_OK -- see the CAUTION comment
+		 * near its definition); a mismatch on any word fails the
+		 * whole match right away.
+		 */
+		const uint8_t jt = length ? 0 : JUMP_OK;
+		struct bpf_insn insns_cmp[] = {
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, word, jt, JUMP_FAIL),
 		};
-		add_insns(ctx, insns_xor, __arraycount(insns_xor));
-
-		if (i > 0) {
-			/* A <- A | X (fold in the earlier words) */
-			struct bpf_insn insns_or[] = {
-				BPF_STMT(BPF_ALU+BPF_OR+BPF_X, 0),
-			};
-			add_insns(ctx, insns_or, __arraycount(insns_or));
-		}
-
-		if (i + 1 < ncmp) {
-			/* X <- A (stash the accumulator for the next word) */
-			struct bpf_insn insns_tax[] = {
-				BPF_STMT(BPF_MISC+BPF_TAX, 0),
-			};
-			add_insns(ctx, insns_tax, __arraycount(insns_tax));
-		} else {
-			/* A == 0 iff every compared word matched? */
-			struct bpf_insn insns_cmp[] = {
-				BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_OK, JUMP_FAIL),
-			};
-			add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
-		}
-	}
-	if (ncmp > 1) {
-		/* X no longer holds the L4 header offset. */
-		ctx->flags &= ~X_EQ_L4OFF;
+		add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
 	}
 
 	uint32_t mwords[] = {
@@ -654,6 +750,8 @@ npfctl_bpf_ports(npf_bpf_t *ctx, unsigned opts, in_port_t from, in_port_t to)
 	assert(((opts & MATCH_SRC) != 0) ^ ((opts & MATCH_DST) != 0));
 	off = (opts & MATCH_SRC) ? sport_off : dport_off;
 
+	seal_prev(ctx);
+
 	/* X <- IP header length */
 	fetch_l3(ctx, AF_UNSPEC, X_EQ_L4OFF);
 
@@ -673,24 +771,19 @@ npfctl_bpf_ports(npf_bpf_t *ctx, unsigned opts, in_port_t from, in_port_t to)
 			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, from, JUMP_OK, JUMP_FAIL),
 		};
 		add_insns(ctx, insns_port, __arraycount(insns_port));
-	} else if (from < to) {
+	} else {
 		/*
-		 * Port range case: shift by 'from' and use an unsigned
-		 * comparison, so that a port below 'from' also wraps
-		 * around and fails the check, e.g.:
-		 *	(port - from) > (to - from) <=> port not in range
+		 * Port range case: A >= from just continues on to check
+		 * A <= to (a plain literal jump, not JUMP_OK); either
+		 * comparison failing fails the whole range check.  If the
+		 * range is reversed (from > to, invalid), the two can
+		 * never both hold and the check naturally always fails.
 		 */
 		struct bpf_insn insns_range[] = {
-			BPF_STMT(BPF_ALU+BPF_SUB+BPF_K, from),
-			BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, to - from, JUMP_FAIL, JUMP_OK),
+			BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, from, 0, JUMP_FAIL),
+			BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, to, JUMP_FAIL, JUMP_OK),
 		};
 		add_insns(ctx, insns_range, __arraycount(insns_range));
-	} else {
-		/* Reversed (invalid) range: can never match. */
-		struct bpf_insn insns_never[] = {
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_FAIL, JUMP_FAIL),
-		};
-		add_insns(ctx, insns_never, __arraycount(insns_never));
 	}
 
 	uint32_t mwords[] = {
@@ -708,15 +801,16 @@ npfctl_bpf_tcpfl(npf_bpf_t *ctx, uint8_t tf, uint8_t tf_mask)
 	const unsigned tcpfl_off = offsetof(struct tcphdr, th_flags);
 	const bool usingmask = tf_mask != tf;
 
+	seal_prev(ctx);
+
 	/* X <- IP header length */
 	fetch_l3(ctx, AF_UNSPEC, X_EQ_L4OFF);
 
 	if ((ctx->flags & CHECKED_L4_PROTO) == 0) {
-		const unsigned jf = usingmask ? 3 : 2;
-		assert(ctx->ingroup == 0);
-
 		/*
-		 * A <- L4 protocol; A == TCP?  If not, jump out.
+		 * A <- L4 protocol; A == TCP?  If not, this criterion is
+		 * vacuously satisfied (JUMP_OK) and the flags below are
+		 * not checked at all.
 		 *
 		 * Note: the TCP flag matching might be without 'proto tcp'
 		 * when using a plain 'stateful' rule.  In such case it also
@@ -724,7 +818,7 @@ npfctl_bpf_tcpfl(npf_bpf_t *ctx, uint8_t tf, uint8_t tf_mask)
 		 */
 		struct bpf_insn insns_tcp[] = {
 			BPF_STMT(BPF_LD+BPF_W+BPF_MEM, BPF_MW_L4PROTO),
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, IPPROTO_TCP, 0, jf),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, IPPROTO_TCP, 0, JUMP_OK),
 		};
 		add_insns(ctx, insns_tcp, __arraycount(insns_tcp));
 	}
@@ -768,6 +862,8 @@ npfctl_bpf_icmp(npf_bpf_t *ctx, int type, int code)
 	assert(offsetof(struct icmp6_hdr, icmp6_code) == code_off);
 	assert(type != -1 || code != -1);
 
+	seal_prev(ctx);
+
 	/* X <- IP header length */
 	fetch_l3(ctx, AF_UNSPEC, X_EQ_L4OFF);
 
@@ -780,6 +876,11 @@ npfctl_bpf_icmp(npf_bpf_t *ctx, int type, int code)
 
 		uint32_t mwords[] = { BM_ICMP_TYPE, 1, type };
 		done_block(ctx, mwords, sizeof(mwords));
+
+		if (code != -1) {
+			/* Type matched: continue on to check the code too. */
+			seal_ok(ctx);
+		}
 	}
 
 	if (code != -1) {
@@ -804,6 +905,8 @@ void
 npfctl_bpf_table(npf_bpf_t *ctx, unsigned opts, unsigned tid)
 {
 	const bool src = (opts & MATCH_SRC) != 0;
+
+	seal_prev(ctx);
 
 	struct bpf_insn insns_table[] = {
 		BPF_STMT(BPF_LD+BPF_IMM, (src ? SRC_FLAG_BIT : 0) | tid),
