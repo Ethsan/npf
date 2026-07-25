@@ -47,11 +47,13 @@
  *	Each test (filter) criterion can be evaluated to true (match) or
  *	false (no match) and the logic is as follows:
  *
- *	- If the value is true, then jump to the "next" test (offset 0).
+ *	- If the value is true, then jump to the JUMP_OK value.
  *
- *	- If the value is false, then jump to the JUMP_MAGIC value (0xff).
- *	This "magic" value is used to indicate that it will have to be
- *	patched at a later stage.
+ *	- If the value is false, then jump to the JUMP_FAIL value.
+ *
+ *	JUMP_OK and JUMP_FAIL are "magic" values used to indicate that
+ *	the jump will have to be patched at a later stage, once the real
+ *	target offset is known.
  *
  *	Once all byte-code fragments are combined into one, then there
  *	are two additional steps:
@@ -59,8 +61,10 @@
  *	- Two instructions are appended at the end of the program: "return
  *	success" followed by "return failure".
  *
- *	- All jumps with the JUMP_MAGIC value are patched to point to the
- *	"return failure" instruction.
+ *	- All jumps with the JUMP_OK value are patched to fall through to
+ *	the next instruction (the "return success" path) and all jumps
+ *	with the JUMP_FAIL value are patched to point to the "return
+ *	failure" instruction.
  *
  *	Therefore, if all filter criteria will match, then the first
  *	instruction will be reached, indicating a successful match of the
@@ -74,11 +78,12 @@
  *
  *		A and B and (C or D)
  *
- *	In such case, the logic inside the group has to be inverted i.e.
- *	the jump values swapped.  If the test value is true, then jump
- *	out of the group; if false, then jump "next".  At the end of the
- *	group, an addition failure path is appended and the JUMP_MAGIC
- *	uses within the group are patched to jump past the said path.
+ *	In such case, the logic inside the group is inverted: JUMP_OK is
+ *	patched to jump out of the group (skipping the remaining
+ *	alternatives), while JUMP_FAIL is patched to fall through and try
+ *	the "next" alternative.  At the end of the group, an additional
+ *	failure path is appended and the JUMP_OK uses within the group are
+ *	patched to jump past the said path.
  */
 
 #include <sys/cdefs.h>
@@ -153,10 +158,14 @@ struct npf_bpf {
 #define	NPF_BPF_FAILURE		0
 
 /*
- * Magic value to indicate the failure path, which is fixed up on completion.
- * Note: this is the longest jump offset in BPF, since the offset is one byte.
+ * Magic values to indicate the success and failure paths, which are
+ * fixed up by fixup_jumps() once a criterion, group or the whole
+ * program is complete and the real target offsets are known.
+ * Note: these are the longest jump offsets in BPF, since the offset
+ * is one byte.
  */
-#define	JUMP_MAGIC		0xff
+#define	JUMP_OK			0xfe
+#define	JUMP_FAIL		0xff
 
 /* Reduce re-allocations by expanding in 64 byte blocks. */
 #define	ALLOC_MASK		(64 - 1)
@@ -179,10 +188,9 @@ fixup_jumps(npf_bpf_t *ctx, u_int start, u_int end, bool swap)
 
 	for (u_int i = start; i < end; i++) {
 		struct bpf_insn *insn = &bp->bf_insns[i];
-		const u_int fail_off = end - i;
-		bool seen_magic = false;
+		const u_int away_off = end - i;
 
-		if (fail_off >= JUMP_MAGIC) {
+		if (away_off >= JUMP_OK) {
 			errx(EXIT_FAILURE, "BPF generation error: "
 			    "the number of instructions is over the limit");
 		}
@@ -191,34 +199,34 @@ fixup_jumps(npf_bpf_t *ctx, u_int start, u_int end, bool swap)
 		}
 		if (BPF_OP(insn->code) == BPF_JA) {
 			/*
-			 * BPF_JA can be used to jump to the failure path.
-			 * If we are swapping i.e. inside the group, then
-			 * jump "next"; groups have a failure path appended
-			 * at their end.
+			 * BPF_JA is only ever used to indicate failure.
+			 * If we are inside a group, then jump "next" to
+			 * try the next alternative; groups have a failure
+			 * path appended at their end.
 			 */
-			if (insn->k == JUMP_MAGIC) {
-				insn->k = swap ? 0 : fail_off;
+			if (insn->k == JUMP_FAIL) {
+				insn->k = swap ? 0 : away_off;
 			}
 			continue;
 		}
 
 		/*
-		 * Fixup the "magic" value.  Swap only the "magic" jumps.
+		 * Resolve the JUMP_OK / JUMP_FAIL markers independently:
+		 * outside of a group, success falls through to the next
+		 * criterion and failure jumps away to the failure path;
+		 * inside a group (disjunction), it is the other way
+		 * around -- success jumps out of the group, while failure
+		 * falls through to try the next alternative.
 		 */
-
-		if (insn->jt == JUMP_MAGIC) {
-			insn->jt = fail_off;
-			seen_magic = true;
+		if (insn->jt == JUMP_OK) {
+			insn->jt = swap ? away_off : 0;
+		} else if (insn->jt == JUMP_FAIL) {
+			insn->jt = swap ? 0 : away_off;
 		}
-		if (insn->jf == JUMP_MAGIC) {
-			insn->jf = fail_off;
-			seen_magic = true;
-		}
-
-		if (seen_magic && swap) {
-			uint8_t jt = insn->jt;
-			insn->jt = insn->jf;
-			insn->jf = jt;
+		if (insn->jf == JUMP_OK) {
+			insn->jf = swap ? away_off : 0;
+		} else if (insn->jf == JUMP_FAIL) {
+			insn->jf = swap ? 0 : away_off;
 		}
 	}
 }
@@ -395,8 +403,8 @@ fetch_l3(npf_bpf_t *ctx, sa_family_t af, unsigned flags)
 	 * - BPF_MW_L4PROTO: L4 protocol.
 	 */
 	if ((ctx->flags & FETCHED_L3) == 0 || (af && ctx->af == 0)) {
-		const uint8_t jt = ver ? 0 : JUMP_MAGIC;
-		const uint8_t jf = ver ? JUMP_MAGIC : 0;
+		const uint8_t jt = ver ? JUMP_OK : JUMP_FAIL;
+		const uint8_t jf = ver ? JUMP_FAIL : JUMP_OK;
 		const bool ingroup = ctx->ingroup != 0;
 		const bool invert = ctx->invert;
 
@@ -483,7 +491,7 @@ npfctl_bpf_proto(npf_bpf_t *ctx, unsigned proto)
 	struct bpf_insn insns_proto[] = {
 		/* A <- L4 protocol; A == expected-protocol? */
 		BPF_STMT(BPF_LD+BPF_W+BPF_MEM, BPF_MW_L4PROTO),
-		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, proto, 0, JUMP_MAGIC),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, proto, JUMP_OK, JUMP_FAIL),
 	};
 	add_insns(ctx, insns_proto, __arraycount(insns_proto));
 
@@ -565,7 +573,7 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 
 		/* A == expected-IP-word ? */
 		struct bpf_insn insns_cmp[] = {
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, word, 0, JUMP_MAGIC),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, word, JUMP_OK, JUMP_FAIL),
 		};
 		add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
 	}
@@ -614,17 +622,27 @@ npfctl_bpf_ports(npf_bpf_t *ctx, unsigned opts, in_port_t from, in_port_t to)
 	if (from == to) {
 		/* Single port case. */
 		struct bpf_insn insns_port[] = {
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, from, 0, JUMP_MAGIC),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, from, JUMP_OK, JUMP_FAIL),
 		};
 		add_insns(ctx, insns_port, __arraycount(insns_port));
-	} else {
-		/* Port range case. */
+	} else if (from < to) {
+		/*
+		 * Port range case: shift by 'from' and use an unsigned
+		 * comparison, so that a port below 'from' also wraps
+		 * around and fails the check, e.g.:
+		 *	(port - from) > (to - from) <=> port not in range
+		 */
 		struct bpf_insn insns_range[] = {
-			BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, from, 0, 1),
-			BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, to, 0, 1),
-			BPF_STMT(BPF_JMP+BPF_JA, JUMP_MAGIC),
+			BPF_STMT(BPF_ALU+BPF_SUB+BPF_K, from),
+			BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, to - from, JUMP_FAIL, JUMP_OK),
 		};
 		add_insns(ctx, insns_range, __arraycount(insns_range));
+	} else {
+		/* Reversed (invalid) range: can never match. */
+		struct bpf_insn insns_never[] = {
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_FAIL, JUMP_FAIL),
+		};
+		add_insns(ctx, insns_never, __arraycount(insns_never));
 	}
 
 	uint32_t mwords[] = {
@@ -679,7 +697,7 @@ npfctl_bpf_tcpfl(npf_bpf_t *ctx, uint8_t tf, uint8_t tf_mask)
 
 	struct bpf_insn insns_cmp[] = {
 		/* A == expected-TCP-flags? */
-		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, tf, 0, JUMP_MAGIC),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, tf, JUMP_OK, JUMP_FAIL),
 	};
 	add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
 
@@ -708,7 +726,7 @@ npfctl_bpf_icmp(npf_bpf_t *ctx, int type, int code)
 	if (type != -1) {
 		struct bpf_insn insns_type[] = {
 			BPF_STMT(BPF_LD+BPF_B+BPF_IND, type_off),
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, type, 0, JUMP_MAGIC),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, type, JUMP_OK, JUMP_FAIL),
 		};
 		add_insns(ctx, insns_type, __arraycount(insns_type));
 
@@ -719,7 +737,7 @@ npfctl_bpf_icmp(npf_bpf_t *ctx, int type, int code)
 	if (code != -1) {
 		struct bpf_insn insns_code[] = {
 			BPF_STMT(BPF_LD+BPF_B+BPF_IND, code_off),
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, code, 0, JUMP_MAGIC),
+			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, code, JUMP_OK, JUMP_FAIL),
 		};
 		add_insns(ctx, insns_code, __arraycount(insns_code));
 
@@ -742,7 +760,7 @@ npfctl_bpf_table(npf_bpf_t *ctx, unsigned opts, unsigned tid)
 	struct bpf_insn insns_table[] = {
 		BPF_STMT(BPF_LD+BPF_IMM, (src ? SRC_FLAG_BIT : 0) | tid),
 		BPF_STMT(BPF_MISC+BPF_COP, NPF_COP_TABLE),
-		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_MAGIC, 0),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_FAIL, JUMP_OK),
 	};
 	add_insns(ctx, insns_table, __arraycount(insns_table));
 
