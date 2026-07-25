@@ -163,6 +163,16 @@ struct npf_bpf {
  * program is complete and the real target offsets are known.
  * Note: these are the longest jump offsets in BPF, since the offset
  * is one byte.
+ *
+ * CAUTION: fixup_jumps() resolves JUMP_OK/JUMP_FAIL to either a fixed
+ * offset (independent of where the instruction sits) or a plain
+ * fall-through to the very next instruction (which depends on it).
+ * Which of the two applies flips depending on whether the code is
+ * inside a group, so only the *last* instruction of a multi-instruction
+ * criterion may use these markers directly -- earlier instructions must
+ * reach that last instruction (or otherwise resolve the criterion)
+ * using plain, non-BPF_JMP arithmetic instead (see npfctl_bpf_cidr()
+ * and the port range case in npfctl_bpf_ports() for examples).
  */
 #define	JUMP_OK			0xfe
 #define	JUMP_FAIL		0xff
@@ -539,8 +549,23 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 
 	length = (mask == NPF_NO_NETMASK) ? maxmask : mask;
 
-	/* CAUTION: BPF operates in host byte-order. */
-	for (unsigned i = 0; i < nwords; i++) {
+	/* The number of words that will actually be compared. */
+	unsigned ncmp = (length + 31) / 32;
+	if (ncmp > nwords) {
+		ncmp = nwords;
+	}
+
+	/*
+	 * CAUTION: BPF operates in host byte-order.
+	 *
+	 * Only the last compared word may use JUMP_OK/JUMP_FAIL directly:
+	 * a match on an earlier word does not yet mean the whole address
+	 * matches.  So, instead of a per-word conditional jump, XOR each
+	 * word against its expected value and OR the differences together
+	 * in X; the accumulated value is zero iff every word matched, and
+	 * only the final word needs a (single) conditional jump.
+	 */
+	for (unsigned i = 0; i < ncmp; i++) {
 		const unsigned woff = i * sizeof(uint32_t);
 		uint32_t word = ntohl(awords[i]);
 		uint32_t wordmask;
@@ -549,12 +574,9 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 			/* The mask is a full word - do not apply it. */
 			wordmask = 0;
 			length -= 32;
-		} else if (length) {
+		} else {
 			wordmask = 0xffffffff << (32 - length);
 			length = 0;
-		} else {
-			/* The mask became zero - skip the rest. */
-			break;
 		}
 
 		/* A <- IP address (or one word of it) */
@@ -571,11 +593,37 @@ npfctl_bpf_cidr(npf_bpf_t *ctx, unsigned opts, sa_family_t af,
 			add_insns(ctx, insns_mask, __arraycount(insns_mask));
 		}
 
-		/* A == expected-IP-word ? */
-		struct bpf_insn insns_cmp[] = {
-			BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, word, JUMP_OK, JUMP_FAIL),
+		/* A <- A ^ expected-IP-word (zero iff this word matches) */
+		struct bpf_insn insns_xor[] = {
+			BPF_STMT(BPF_ALU+BPF_XOR+BPF_K, word),
 		};
-		add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
+		add_insns(ctx, insns_xor, __arraycount(insns_xor));
+
+		if (i > 0) {
+			/* A <- A | X (fold in the earlier words) */
+			struct bpf_insn insns_or[] = {
+				BPF_STMT(BPF_ALU+BPF_OR+BPF_X, 0),
+			};
+			add_insns(ctx, insns_or, __arraycount(insns_or));
+		}
+
+		if (i + 1 < ncmp) {
+			/* X <- A (stash the accumulator for the next word) */
+			struct bpf_insn insns_tax[] = {
+				BPF_STMT(BPF_MISC+BPF_TAX, 0),
+			};
+			add_insns(ctx, insns_tax, __arraycount(insns_tax));
+		} else {
+			/* A == 0 iff every compared word matched? */
+			struct bpf_insn insns_cmp[] = {
+				BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, JUMP_OK, JUMP_FAIL),
+			};
+			add_insns(ctx, insns_cmp, __arraycount(insns_cmp));
+		}
+	}
+	if (ncmp > 1) {
+		/* X no longer holds the L4 header offset. */
+		ctx->flags &= ~X_EQ_L4OFF;
 	}
 
 	uint32_t mwords[] = {
